@@ -1,0 +1,132 @@
+#!/usr/bin/env python
+import pyinotify
+import subprocess
+import functools
+import hashlib
+import os
+import sys
+import json
+
+from threading import Timer
+from pathlib import Path
+
+DIR_SEP = '/'
+CONF_FILE_NAME = '.dfsync.json'
+EVENT_MASK = pyinotify.IN_DELETE | pyinotify.IN_CREATE | pyinotify.IN_ATTRIB
+
+def md5(string):
+    return hashlib.md5(string.encode('utf-8')).hexdigest()
+
+def on_loop(notifier, dirSync):
+    while (len(dirSync.syncDirs)):
+        base_dir = dirSync.syncDirs.pop()
+        dirSync.syncDir(base_dir)
+
+def doRsync(src_path, dest_path, dirSync):
+    #print('Will now sync : ' + src_path)
+    subprocess.run(["rsync", "-ua", "--delete", src_path, dest_path])
+    
+    hash_key = md5(src_path)
+    del dirSync.syncTimers[hash_key]
+    
+def create_conf_file_template(path):
+    content = """{
+  "BASE_PATH": "",
+  "BASE_DIRS": [],
+  "DEST_PATH": "",
+  "IGNORE_FILES": []
+}
+"""
+    with open(config_file, 'w') as the_file:
+        the_file.write(content)
+    
+
+class DirSync():
+    def __init__(self, 
+                 base_path, 
+                 dest_path, 
+                 base_dirs, 
+                 ignore_files):
+        
+        self.base_path    = base_path
+        self.dest_path    = dest_path
+        self.base_dirs    = base_dirs
+        self.ignore_files = ignore_files
+        self.syncDirs     = set()
+        self.syncTimers   = dict()
+
+    def shouldIgnoreFile(self, file):
+        return any(t_str in file for t_str in self.ignore_files)
+
+    def getBaseDir(self, pathname):
+        for p in self.base_dirs:
+            path = DIR_SEP + p + DIR_SEP
+            if path in pathname:
+                return self.base_path + DIR_SEP + p
+        return False
+
+    def addSync(self, path):
+        self.syncDirs.add(path)
+
+    def syncDir(self, dir_path):
+        hash_key = md5(dir_path)
+        if hash_key in self.syncTimers:
+            return
+        
+        self.syncTimers[hash_key] = Timer(0.1, doRsync, (dir_path, self.dest_path, self))
+        self.syncTimers[hash_key].start()
+
+
+class EventHandler(pyinotify.ProcessEvent):
+    def my_init(self, dirSync=None):
+        if dirSync is None:
+            dirSync = DirSync()
+        self.dirSync = dirSync
+
+    def process_default(self, event):
+        if self.dirSync.shouldIgnoreFile(event.pathname):
+            return
+        
+        base_dir = self.dirSync.getBaseDir(event.pathname)
+        if (base_dir is False):
+            return
+        
+        self.dirSync.addSync(base_dir)
+        
+        #print("event: "+event.maskname+" on: "+base_dir)
+
+if __name__ == '__main__':
+    
+    config_file = str(Path.home()) + DIR_SEP + CONF_FILE_NAME
+    if not os.path.isfile(config_file):
+        print("Creating new config file: " + config_file)
+        create_conf_file_template(config_file)
+        
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+    
+    if not config['BASE_PATH'] or not config['DEST_PATH']:
+        print('Base path and destination paths area required')
+        sys.exit()
+    
+    # Instanciate a new WatchManager (will be used to store watches).
+    wm = pyinotify.WatchManager()
+    dirSync = DirSync(
+            config['BASE_PATH'],
+            config['DEST_PATH'],
+            config['BASE_DIRS'],
+            config['IGNORE_FILES']
+        )
+    
+    handler = EventHandler(dirSync=dirSync)
+
+    # Associate this WatchManager with a Notifier (will be used to process events).
+    notifier = pyinotify.Notifier(wm, handler)
+
+    for base_dir in config['BASE_DIRS']:
+        wm.add_watch(config['BASE_PATH'] + DIR_SEP + base_dir, EVENT_MASK, rec=True, auto_add=True)
+            
+    on_loop_func = functools.partial(on_loop, dirSync=dirSync)
+
+    # Loop forever and handle events.
+    notifier.loop(daemonize=False, callback=on_loop_func)
